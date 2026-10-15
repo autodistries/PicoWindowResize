@@ -1,0 +1,7 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="research.pico.windowresize" android:versionCode="9" android:versionName="0.5.0">
+<uses-sdk android:minSdkVersion="29" android:targetSdkVersion="29"/>
+<application android:label="PICO Border Resize" android:allowBackup="false" android:extractNativeLibs="false" android:theme="@android:style/Theme.Material.NoActionBar">
+<meta-data android:name="xposedmodule" android:value="true"/><meta-data android:name="xposedminversion" android:value="93"/><meta-data android:name="xposedsharedprefs" android:value="true"/><meta-data android:name="xposeddescription" android:value="Experimental outside-border resizing for PICO far panels"/><meta-data android:name="xposedscope" android:resource="@array/scope"/>
+<activity android:name=".MainActivity" android:exported="true"><intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter><meta-data android:name="pico.vr.position" android:value="near"/></activity>
+<provider android:name=".SizeStore" android:authorities="research.pico.windowresize.sizes" android:exported="true" android:grantUriPermissions="false"/>
+</application></manifest>

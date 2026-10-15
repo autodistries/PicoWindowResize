@@ -1,0 +1,45 @@
+# Generated output and downloaded dependencies
+/build/
+/dist/
+/deps/
+*.apk
+*.apks
+*.aab
+*.dex
+*.class
+*.so
+*.o
+*.jar
+
+# Signing material and credentials
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.pem
+*.key
+.env
+.env.*
+!.env.example
+local.properties
+
+# Device captures and private research
+/logs/
+/evidence/
+/firmware/
+/research/
+*.log
+*.img
+*.dump
+*.trace
+*.zip
+
+# Local tooling
+__pycache__/
+*.py[cod]
+.venv/
+.idea/
+.vscode/
+.DS_Store
+*~
+*.swp
