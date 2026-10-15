@@ -7,12 +7,14 @@ import java.util.*;
 import de.robv.android.xposed.*;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
-/** Phoenix 5.13.7 only. XRShell and SystemExt hooks; native patches last for the process. */
+/** Validated shell contracts. XRShell and SystemExt hooks; native patches last for the process. */
 public final class HookEntry implements IXposedHookLoadPackage, IXposedHookZygoteInit {
     private static String modulePath;
     @Override public void initZygote(StartupParam startup){ modulePath=startup.modulePath; }
     private boolean nativeLoaded;
     private int nativeState;
+    private boolean javaReady;
+    private String startupError="";
     private static final String ENGINE="com.picoxr.xrshell.engine.XREngine";
     private static final String PROVIDER="com.picoxr.xrshell.event.EventWindowProvider";
     private static final String EVENT="com.picoxr.xrshell.event.EventDispatcher$EventData";
@@ -50,8 +52,18 @@ public final class HookEntry implements IXposedHookLoadPackage, IXposedHookZygot
             try{DisplayResizeBridge.install(load.classLoader);}catch(Throwable failure){XposedBridge.log("PICO Border Resize: SystemExt bridge failed "+failure);}return;
         }
         if (!load.packageName.equals("com.picoxr.xrshell") || !load.isFirstApplication) return;
-        try { install(load.classLoader); XposedBridge.log("PICO Border Resize: hooks installed; default OFF"); }
-        catch(Throwable t){ broken=true; XposedBridge.log("PICO Border Resize: disabled, incompatible firmware: "+t); }
+        StatusReporter reporter=new StatusReporter();
+        Handler statusTimer=new Handler(Looper.getMainLooper());
+        statusTimer.postDelayed(new Runnable(){public void run(){
+            android.os.Bundle status=new android.os.Bundle();
+            status.putString("moduleVersion",Version.NAME);
+            status.putBoolean("javaReady",javaReady);status.putBoolean("enabled",enabled);status.putBoolean("broken",broken);
+            status.putInt("nativeState",nativeState);status.putString("error",startupError);
+            if(nativeLoaded)try{status.putString("native",NativeBorder.diagnostics());}catch(Throwable t){status.putString("error",t.toString());}
+            reporter.report(status);statusTimer.postDelayed(this,5000);
+        }},1000);
+        try { install(load.classLoader); javaReady=true; XposedBridge.log("PICO Border Resize: hooks installed; default OFF"); }
+        catch(Throwable t){ broken=true; startupError=t.toString(); XposedBridge.log("PICO Border Resize: disabled, incompatible firmware: "+t); }
     }
     private Object engine(){return XposedHelpers.callStaticMethod(engineClass,"getInstance");}
     private void install(ClassLoader cl) {
@@ -116,6 +128,7 @@ public final class HookEntry implements IXposedHookLoadPackage, IXposedHookZygot
                 java.io.PrintWriter out=(java.io.PrintWriter)p.args[1];
                 out.println("BorderResize "+Version.NAME+" enabled="+enabled+" broken="+broken+" prefs="+prefs.getFile());
                 if(nativeLoaded){out.println("nativeStatus,attempts,hits="+Arrays.toString(NativeBorder.stats()));
+                    out.println(NativeBorder.diagnostics());
                     out.println("nativeDrag panel,width,height,serial="+Arrays.toString(NativeBorder.dragSize()));}
                 if(capture!=null)out.println("resize capture display="+capture.display+" lastRequested="+capture.lastW+"x"+capture.lastH);
                 out.println("motion="+motionCount+" outside="+outsideCount+" presses="+pressCount+" captures="+captureCount+" lastPress="+lastPress);

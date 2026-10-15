@@ -1,4 +1,7 @@
 #include "drag.h"
+#include "resolve.h"
+#include "abi.h"
+#include <cstdio>
 #include <jni.h>
 #include <link.h>
 #include <elf.h>
@@ -8,13 +11,30 @@
 #include <atomic>
 #include <algorithm>
 #include <time.h>
+#include <android/log.h>
 
 static RayFunction original=nullptr;
 static std::atomic<bool> active{false};
 static std::atomic<unsigned long> attempts{0},successes{0};
 static int installed=0;
-static const unsigned char expectedId[]={0x49,0xae,0xdb,0x5b,0x2b,0x34,0x86,0x37,0x52,0x60,0x05,0x7e,0x0f,0x27,0x3f,0x3b,0x42,0x30,0xfd,0x6f};
-static uintptr_t libraryBase=0;
+static unsigned checksPassed=0;
+static char loadedBuildId[129]="unavailable";
+struct NativeApi {
+    void* manager=nullptr;uintptr_t cylinderVptr=0,controllerVptr=0;
+    void* (*panelById)(void*,int)=nullptr;
+    int (*deviceId)(void*)=nullptr;
+    Cylinder (*cylinderInfo)(void*)=nullptr;
+    Vec3 (*position)(void*)=nullptr;Quat (*orientation)(void*)=nullptr;
+    void (*setPosition)(void*,const Vec3&)=nullptr;
+    void (*setOrientation)(void*,const Quat&)=nullptr;
+    bool (*triggerValue)(void*,float&)=nullptr;
+    PanelLayout layout;
+};
+static NativeApi api;
+static std::atomic<bool> sawTriggerHeld{false};
+static void* getPanel(int id){return api.panelById(api.manager,id);}
+static void* getLayer(void* panel){return *(void**)((char*)panel+api.layout.layer);}
+static void* getTransform(void* layer){return *(void**)((char*)layer+api.layout.transform);}
 struct PanelVector {void** begin;void** end;void** capacity;};
 using HitFunction=void(*)(void*,const PanelVector&,void*,void*);
 static HitFunction originalHit=nullptr;
@@ -32,15 +52,20 @@ static void updateDrag(Vec3 direction,Vec3 origin){
 }
 static void hitProxy(void* manager,const PanelVector& panels,void* info,void* source){
     int id=capturedId.load(std::memory_order_acquire);
-    if(active.load(std::memory_order_relaxed)&&id>0&&source&&libraryBase){
-        int device=((int(*)(void*))(libraryBase+0x1cf538))(source);
+    if(active.load(std::memory_order_relaxed)&&id>0&&source&&api.manager){
+        int device=api.deviceId(source);
         if(device==capturedDevice.load(std::memory_order_relaxed)){
-            // Pinned ControllerInputSource: last OpenXR trigger-click currentState.
-            if(*(uintptr_t*)source==libraryBase+0x3528f0&&!*((unsigned char*)source+0xb38)){
-                triggerReleased.store(true,std::memory_order_release);
-                originalHit(manager,panels,info,source);return;
+            if(*(uintptr_t*)source==api.controllerVptr){
+                float value=NAN;
+                if(api.triggerValue(source,value)&&std::isfinite(value)&&value>=0&&value<=1){
+                    if(value>.1f)sawTriggerHeld.store(true,std::memory_order_relaxed);
+                    else if(sawTriggerHeld.load(std::memory_order_relaxed)){
+                        triggerReleased.store(true,std::memory_order_release);
+                        originalHit(manager,panels,info,source);return;
+                    }
+                }
             }
-            void* panel=((void*(*)(void*,int))(libraryBase+0x1e7cf8))((void*)(libraryBase+0x368e88),id);
+            void* panel=getPanel(id);
             if(panel){
                 PanelVector single{&panel,&panel+1,&panel+1};
                 forced=true;originalHit(manager,single,info,source);forced=false;return;
@@ -92,50 +117,120 @@ static bool selfTest(){
     original({0,.56f/sqrtf(4+.56f*.56f),-2/sqrtf(4+.56f*.56f)},center,center,identity,c,size,hit,point,x,y,normal,{-48,-48,1048,548});
     if(hit)return false; // outside stock height (1 metre)
     original({0,.56f/sqrtf(4+.56f*.56f),-2/sqrtf(4+.56f*.56f)},center,center,identity,e.cylinder,size,hit,point,x,y,normal,{0,0,1000,500});
-    return hit&&fabsf(remap(y,500,e.fy)+30)<2;
+    if(!hit||fabsf(remap(y,500,e.fy)+30)>=2)return false;
+    Quat yaw{cosf(.2f),0,sinf(.2f),0};Vec3 translated{.4f,-.2f,.3f};
+    Vec3 direction=rotate(yaw,{0,0,-1}),expected=rotate(yaw,{0,0,-2});
+    original(direction,translated,translated,yaw,c,size,hit,point,x,y,normal,{0,0,1000,500});
+    return hit&&fabsf(x-500)<1&&fabsf(y-250)<1
+        &&fabsf(point.x-translated.x-expected.x)<.01f
+        &&fabsf(point.y-translated.y-expected.y)<.01f
+        &&fabsf(point.z-translated.z-expected.z)<.01f;
 }
-static bool buildMatches(const dl_phdr_info* info){
-    for(int i=0;i<info->dlpi_phnum;i++){
-        const auto& ph=info->dlpi_phdr[i];if(ph.p_type!=PT_NOTE)continue;
-        auto p=(const unsigned char*)(info->dlpi_addr+ph.p_vaddr);
-        auto end=p+ph.p_memsz;
-        while(p+sizeof(Elf64_Nhdr)<=end){
-            auto n=(const Elf64_Nhdr*)p;p+=sizeof(*n);
-            size_t names=(n->n_namesz+3)&~size_t(3),desc=(n->n_descsz+3)&~size_t(3);
-            if(names>size_t(end-p)||desc>size_t(end-p)-names)break;
-            if(n->n_type==NT_GNU_BUILD_ID&&n->n_namesz==4&&!memcmp(p,"GNU",4)
-               &&n->n_descsz==sizeof(expectedId)&&!memcmp(p+names,expectedId,sizeof(expectedId)))return true;
-            p+=names+desc;
+static bool resolveApi(const ModuleView& view){
+    NativeApi next;
+    next.manager=view.symbol("_ZZN7XRShell5Utils9SingletonI12PanelManagerE11getInstanceEvE8instance",PF_R,sizeof(void*));
+    auto cv=view.symbol("_ZTV13CylinderLayer",PF_R,3*sizeof(void*));
+    auto iv=view.symbol("_ZTV21ControllerInputSource",PF_R,3*sizeof(void*));
+    if(!next.manager||!cv||!iv){__android_log_print(ANDROID_LOG_ERROR,"PicoBorderResize","missing manager/vtables: %p %p %p",next.manager,cv,iv);return false;}
+    next.cylinderVptr=(uintptr_t)cv+2*sizeof(void*);next.controllerVptr=(uintptr_t)iv+2*sizeof(void*);
+    next.panelById=(decltype(next.panelById))view.symbol("_ZN12PanelManager12getPanelByIdEi");
+    next.deviceId=(decltype(next.deviceId))view.symbol("_ZNK15InputSourceBase11getDeviceIdEv");
+    next.cylinderInfo=(decltype(next.cylinderInfo))view.symbol("_ZN13CylinderLayer15getCylinderInfoEv",PF_R|PF_X,sizeof(cylinderReturn));
+    next.position=(decltype(next.position))view.symbol("_ZN11XRTransform16getWorldPositionEv",PF_R|PF_X,sizeof(positionReturn));
+    next.orientation=(decltype(next.orientation))view.symbol("_ZN11XRTransform19getWorldOrientationEv",PF_R|PF_X,sizeof(orientationReturn));
+    next.setPosition=(decltype(next.setPosition))view.symbol("_ZN11XRTransform16setWorldPositionERKN3glm3vecILi3EfLNS0_9qualifierE0EEE");
+    next.setOrientation=(decltype(next.setOrientation))view.symbol("_ZN11XRTransform19setWorldOrientationERKN3glm3quaIfLNS0_9qualifierE0EEE");
+    next.triggerValue=(decltype(next.triggerValue))view.symbol("_ZNK21ControllerInputSource15getTriggerValueERf");
+    auto valid=(const uint32_t*)view.symbol("_ZNK5Panel7isValidEv",PF_R|PF_X,8*sizeof(uint32_t));
+    auto keyboard=(const uint32_t*)view.symbol("_ZN12PanelManager10isKeyboardEP5Panel",PF_R|PF_X,9*sizeof(uint32_t));
+    if(!next.panelById||!next.deviceId||!next.cylinderInfo||!next.position||!next.orientation
+       ||!next.setPosition||!next.setOrientation||!next.triggerValue||!valid||!keyboard)return false;
+    checksPassed|=1;
+    if(!deriveLayout(valid,keyboard,next.layout))return false;
+    checksPassed|=2;
+    if(!accessorContract((const uint32_t*)next.cylinderInfo,cylinderReturn)
+       ||!accessorContract((const uint32_t*)next.position,positionReturn)
+       ||!accessorContract((const uint32_t*)next.orientation,orientationReturn))return false;
+    checksPassed|=4;
+    api=next;return true;
+}
+static int pageProtection(uintptr_t address){
+    FILE* maps=fopen("/proc/self/maps","r");if(!maps)return -1;
+    char line[1024],mode[5];unsigned long first,last;int result=-1;
+    while(fgets(line,sizeof(line),maps))if(sscanf(line,"%lx-%lx %4s",&first,&last,mode)==3&&address>=first&&address<last){
+        result=(mode[0]=='r'?PROT_READ:0)|(mode[1]=='w'?PROT_WRITE:0)|(mode[2]=='x'?PROT_EXEC:0);break;
+    }
+    fclose(maps);return result;
+}
+static bool patchSlots(uintptr_t* raySlot,uintptr_t* hitSlot){
+    long size=sysconf(_SC_PAGESIZE);if(size<=0||(size&(size-1)))return false;
+    uintptr_t pages[2]={(uintptr_t)raySlot&~(uintptr_t(size)-1),(uintptr_t)hitSlot&~(uintptr_t(size)-1)};
+    int count=pages[0]==pages[1]?1:2,protection[2];
+    for(int i=0;i<count;i++){
+        protection[i]=pageProtection(pages[i]);
+        if(protection[i]<0||!(protection[i]&PROT_READ)||(protection[i]&PROT_EXEC))return false;
+    }
+    int opened=0;
+    for(;opened<count;opened++)if(mprotect((void*)pages[opened],size,protection[opened]|PROT_WRITE))break;
+    if(opened!=count){for(int i=0;i<opened;i++)mprotect((void*)pages[i],size,protection[i]);return false;}
+    __atomic_store_n(raySlot,(uintptr_t)&retry,__ATOMIC_RELEASE);
+    __atomic_store_n(hitSlot,(uintptr_t)&hitProxy,__ATOMIC_RELEASE);
+    bool restored=true;for(int i=0;i<count;i++)if(mprotect((void*)pages[i],size,protection[i]))restored=false;
+    if(!restored){
+        bool writable=true;for(int i=0;i<count;i++)if(mprotect((void*)pages[i],size,protection[i]|PROT_WRITE))writable=false;
+        if(writable){__atomic_store_n(raySlot,(uintptr_t)original,__ATOMIC_RELEASE);__atomic_store_n(hitSlot,(uintptr_t)originalHit,__ATOMIC_RELEASE);}
+        for(int i=0;i<count;i++)mprotect((void*)pages[i],size,protection[i]);
+    }
+    return restored;
+}
+static void readBuildId(const ModuleView& view){
+    for(int i=0;i<view.info.dlpi_phnum;i++){
+        auto& p=view.info.dlpi_phdr[i];if(p.p_type!=PT_NOTE)continue;
+        uintptr_t address=view.info.dlpi_addr+p.p_vaddr;
+        size_t size=p.p_memsz;if(!view.contains(address,size))continue;
+        for(size_t at=0;at<=size&&size-at>=sizeof(Elf64_Nhdr);){
+            auto n=(const Elf64_Nhdr*)(address+at);at+=sizeof(*n);
+            size_t names=(size_t(n->n_namesz)+3)&~size_t(3),desc=(size_t(n->n_descsz)+3)&~size_t(3);
+            if(names>size-at||desc>size-at-names)break;
+            if(n->n_type==NT_GNU_BUILD_ID&&n->n_namesz==4&&!memcmp((void*)(address+at),"GNU",4)
+               &&n->n_descsz>0&&n->n_descsz<=64){
+                auto bytes=(const unsigned char*)(address+at+names);
+                for(unsigned j=0;j<n->n_descsz;j++)snprintf(loadedBuildId+j*2,3,"%02x",bytes[j]);
+                return;
+            }
+            at+=names+desc;
         }
-    }return false;
+    }
 }
 static int locate(dl_phdr_info* info,size_t,void*){
-    if(!info->dlpi_name||!strstr(info->dlpi_name,"libxrshell.so"))return 0;
-    if(!buildMatches(info)){installed=-1;return 1;}
-    uintptr_t base=info->dlpi_addr;
-    auto hitSlot=(uintptr_t*)(base+0x362a00);
-    // Pinned ELF R_AARCH64_JUMP_SLOT for rayHitCylinderLayer, not executable code patching.
-    auto slot=(uintptr_t*)(base+0x362a60);
-    if(__atomic_load_n(slot,__ATOMIC_ACQUIRE)!=base+0x1fcaa0||__atomic_load_n(hitSlot,__ATOMIC_ACQUIRE)!=base+0x1c4da0){installed=-2;return 1;}
-    original=(RayFunction)(base+0x1fcaa0);
-    if(!selfTest()){installed=-3;original=nullptr;return 1;}
-    long pageSize=sysconf(_SC_PAGESIZE);if(pageSize<=0){installed=-4;return 1;}
-    void* page=(void*)((uintptr_t)slot&~(uintptr_t(pageSize)-1));
-    if(mprotect(page,pageSize,PROT_READ|PROT_WRITE)){installed=-4;return 1;}
-    libraryBase=base;originalHit=(HitFunction)(base+0x1c4da0);
-    __atomic_store_n(slot,(uintptr_t)&retry,__ATOMIC_RELEASE);
-    __atomic_store_n(hitSlot,(uintptr_t)&hitProxy,__ATOMIC_RELEASE);
-    if(mprotect(page,pageSize,PROT_READ)){
-        // Restore original dispatch before reporting failure; helper remains resident.
-        __atomic_store_n(slot,(uintptr_t)original,__ATOMIC_RELEASE);
-        __atomic_store_n(hitSlot,(uintptr_t)originalHit,__ATOMIC_RELEASE);
-        mprotect(page,pageSize,PROT_READ);installed=-5;return 1;
-    }
-    installed=1;return 1;
+    const char* name=info->dlpi_name;if(!name)return 0;
+    const char* leaf=strrchr(name,'/');leaf=leaf?leaf+1:name;
+    if(strcmp(leaf,"libxrshell.so"))return 0;
+    ModuleView view{*info};readBuildId(view);
+    original=(RayFunction)view.symbol(raySymbol);
+    originalHit=(HitFunction)view.symbol(hitSymbol);
+    auto slot=view.jumpSlot(raySymbol),hitSlot=view.jumpSlot(hitSymbol);
+    __android_log_print(ANDROID_LOG_INFO,"PicoBorderResize","discovery ray=%p hit=%p raySlot=%p hitSlot=%p",(void*)original,(void*)originalHit,(void*)slot,(void*)hitSlot);
+    if(slot&&hitSlot)checksPassed|=8;
+    bool ready=original&&originalHit&&slot&&hitSlot&&resolveApi(view);
+    if(!ready){installed=-1;return 1;}
+    if(__atomic_load_n(slot,__ATOMIC_ACQUIRE)!=(uintptr_t)original||__atomic_load_n(hitSlot,__ATOMIC_ACQUIRE)!=(uintptr_t)originalHit){installed=-2;return 1;}
+    checksPassed|=16;
+    if(!selfTest()){installed=-3;return 1;}
+    checksPassed|=32;
+    if(!patchSlots(slot,hitSlot)){installed=-4;return 1;}
+    checksPassed|=64;installed=1;return 1;
 }
 extern "C" JNIEXPORT jint JNICALL Java_research_pico_windowresize_NativeBorder_install(JNIEnv*,jclass){
     if(!installed)dl_iterate_phdr(locate,nullptr);
     return installed;
+}
+extern "C" JNIEXPORT jstring JNICALL Java_research_pico_windowresize_NativeBorder_diagnostics(JNIEnv* env,jclass){
+    const char* labels[]={"Native exports and vtables","Panel layout contract","Accessor ABI contracts","ELF hook relocations","Original hook targets","Ray ABI and geometry self-test","Hook installation"};
+    char text[2048];int used=snprintf(text,sizeof(text),"Loaded ELF build ID: %s\n",loadedBuildId);
+    for(unsigned i=0;i<7;i++)used+=snprintf(text+used,sizeof(text)-used,"%s: %s\n",labels[i],
+        (checksPassed&(1u<<i))?"PASS":(installed==0?"WAITING":"NOT PASSED"));
+    return env->NewStringUTF(text);
 }
 extern "C" JNIEXPORT void JNICALL Java_research_pico_windowresize_NativeBorder_setEnabled(JNIEnv*,jclass,jboolean value){active.store(value==JNI_TRUE,std::memory_order_release);if(!value)capturedId.store(0,std::memory_order_release);}
 extern "C" JNIEXPORT jlongArray JNICALL Java_research_pico_windowresize_NativeBorder_stats(JNIEnv* env,jclass){
@@ -146,17 +241,17 @@ extern "C" JNIEXPORT jlongArray JNICALL Java_research_pico_windowresize_NativeBo
 // begin/anchor are called through XREngine.queueTask, never on UI/Binder threads.
 extern "C" JNIEXPORT jboolean JNICALL Java_research_pico_windowresize_NativeBorder_begin(JNIEnv*,jclass,jint id,jint device,jint w,jint h,jint sx,jint sy){
     if(installed!=1||!active.load()||id<=0||(device!=1&&device!=2)||w<=0||h<=0)return false;
-    void* panel=((void*(*)(void*,int))(libraryBase+0x1e7cf8))((void*)(libraryBase+0x368e88),id);
-    if(!panel||*(int*)((char*)panel+0x14)!=3002)return false;
-    void* layer=*(void**)((char*)panel+0x58);if(!layer)return false;
-    if(*(uintptr_t*)layer!=libraryBase+0x3533f0)return false;
-    void* transform=*(void**)((char*)layer+8);if(!transform)return false;
-    Cylinder c=((Cylinder(*)(void*))(libraryBase+0x1d4e88))(layer);
+    void* panel=getPanel(id);
+    if(!panel||*(int*)((char*)panel+api.layout.type)!=3002)return false;
+    void* layer=getLayer(panel);if(!layer)return false;
+    if(*(uintptr_t*)layer!=api.cylinderVptr)return false;
+    void* transform=getTransform(layer);if(!transform)return false;
+    Cylinder c=api.cylinderInfo(layer);
     if(!std::isfinite(c.radius)||!std::isfinite(c.angle)||!std::isfinite(c.aspect)||c.radius<=0||c.angle<=0||c.aspect<=0)return false;
     Drag next{};next.id=id;next.w=w;next.h=h;next.sx=sx;next.sy=sy;next.initial=c;
-    next.position=((Vec3(*)(void*))(libraryBase+0x1ffe30))(transform);
-    next.rotation=((Quat(*)(void*))(libraryBase+0x1ffc38))(transform);
-    drag=next;anchorUntil=0;targetWidth=w;targetHeight=h;dragSerial=0;capturedDevice=device;triggerReleased=false;
+    next.position=api.position(transform);
+    next.rotation=api.orientation(transform);
+    drag=next;anchorUntil=0;targetWidth=w;targetHeight=h;dragSerial=0;capturedDevice=device;triggerReleased=false;sawTriggerHeld=false;
     capturedId.store(id,std::memory_order_release);return true;
 }
 extern "C" JNIEXPORT void JNICALL Java_research_pico_windowresize_NativeBorder_end(JNIEnv*,jclass){anchorUntil.store(nowNs()+1000000000);capturedId.store(0,std::memory_order_release);}
@@ -165,14 +260,15 @@ extern "C" JNIEXPORT jintArray JNICALL Java_research_pico_windowresize_NativeBor
     jintArray result=env->NewIntArray(5);if(result)env->SetIntArrayRegion(result,0,5,data);return result;
 }
 extern "C" JNIEXPORT void JNICALL Java_research_pico_windowresize_NativeBorder_anchor(JNIEnv*,jclass,jint id){
-    if(id!=drag.id||!libraryBase||!active.load()||(capturedId.load()!=id&&nowNs()>anchorUntil.load()))return;
-    void* panel=((void*(*)(void*,int))(libraryBase+0x1e7cf8))((void*)(libraryBase+0x368e88),id);
-    if(!panel)return;void* layer=*(void**)((char*)panel+0x58);if(!layer)return;
-    void* transform=*(void**)((char*)layer+8);if(!transform)return;
-    Cylinder c=((Cylinder(*)(void*))(libraryBase+0x1d4e88))(layer);
+    if(id!=drag.id||!api.manager||!active.load()||(capturedId.load()!=id&&nowNs()>anchorUntil.load()))return;
+    void* panel=getPanel(id);
+    if(!panel||*(int*)((char*)panel+api.layout.type)!=3002)return;
+    void* layer=getLayer(panel);if(!layer||*(uintptr_t*)layer!=api.cylinderVptr)return;
+    void* transform=getTransform(layer);if(!transform)return;
+    Cylinder c=api.cylinderInfo(layer);
     if(!std::isfinite(c.radius)||!std::isfinite(c.angle)||!std::isfinite(c.aspect)||c.radius<=0||c.angle<=0||c.aspect<=0)return;
     Quat rotation=resizedRotation(drag,c);
     Vec3 position=anchoredPosition(drag,c,rotation);
-    ((void(*)(void*,const Quat&))(libraryBase+0x1ff8a8))(transform,rotation);
-    ((void(*)(void*,const Vec3&))(libraryBase+0x1ff5b0))(transform,position);
+    api.setOrientation(transform,rotation);
+    api.setPosition(transform,position);
 }

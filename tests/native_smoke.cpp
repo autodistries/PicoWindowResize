@@ -62,20 +62,22 @@ int main(){
     }
     check(installed==0,"geometry test did not patch GOT");
     dl_iterate_phdr(locate,nullptr);
-    check(installed==1,"build-ID pin, self-test and GOT install in isolated process");
+    check(installed==1,"symbol/layout checks, self-test and GOT install in isolated process");
+    check(checksPassed==127,"all seven diagnostic check groups passed");
+    check(strcmp(loadedBuildId,"unavailable")!=0&&strlen(loadedBuildId)>=32,"loaded ELF build ID discovered");
     alignas(16) unsigned char transform[4096]{};
-    ((void(*)(void*))(libraryBase+0x1fef6c))(transform);
+    ((void(*)(void*))dlsym(library,"_ZN11XRTransformC1Ev"))(transform);
     Vec3 desired{1.2f,-.4f,-2.3f};
-    ((void(*)(void*,const Vec3&))(libraryBase+0x1ff5b0))(transform,desired);
-    Vec3 actual=((Vec3(*)(void*))(libraryBase+0x1ffe30))(transform);
+    api.setPosition(transform,desired);
+    Vec3 actual=api.position(transform);
     check(fabsf(actual.x-desired.x)<.0001f&&fabsf(actual.y-desired.y)<.0001f&&fabsf(actual.z-desired.z)<.0001f,"actual firmware world position setter/getter ABI");
-    Quat orientation=((Quat(*)(void*))(libraryBase+0x1ffc38))(transform);
+    Quat orientation=api.orientation(transform);
     check(fabsf(orientation.w-1)<.0001f&&fabsf(orientation.x)<.0001f&&fabsf(orientation.y)<.0001f&&fabsf(orientation.z)<.0001f,"actual firmware quaternion storage ABI");
     Quat wanted{cosf(.2f),0,sinf(.2f),0};
-    ((void(*)(void*,const Quat&))(libraryBase+0x1ff8a8))(transform,wanted);
-    orientation=((Quat(*)(void*))(libraryBase+0x1ffc38))(transform);
+    api.setOrientation(transform,wanted);
+    orientation=api.orientation(transform);
     check(fabsf(orientation.w-wanted.w)<.0001f&&fabsf(orientation.y-wanted.y)<.0001f&&fabsf(orientation.x)<.0001f&&fabsf(orientation.z)<.0001f,"actual firmware world orientation setter/getter ABI");
-    ((void(*)(void*))(libraryBase+0x20071c))(transform);
+    ((void(*)(void*))dlsym(library,"_ZN11XRTransformD1Ev"))(transform);
     printf("native install status=%d\n",installed);
     printf("%d native assertions passed (firmware ray checks + drag geometry); isolated-process GOT tested; compositor untouched\n",checks);
 }

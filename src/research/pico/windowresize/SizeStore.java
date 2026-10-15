@@ -10,10 +10,20 @@ public final class SizeStore extends ContentProvider {
     static final Uri URI=Uri.parse("content://research.pico.windowresize.sizes");
     static boolean valid(int w,int h){return w>=480&&w<=2560&&h>=320&&h<=1440;}
     private int boot;
+    private Bundle status;
     @Override public boolean onCreate(){boot=android.provider.Settings.Global.getInt(getContext().getContentResolver(),"boot_count",0);return true;}
     @Override public synchronized Bundle call(String method,String pkg,Bundle args){
         int uid=Binder.getCallingUid();
         if(uid!=1000&&uid!=android.os.Process.myUid())throw new SecurityException("System caller required");
+        if("reportStatus".equals(method)){
+            if(uid!=1000)throw new SecurityException("System caller required");
+            if(args!=null){status=new Bundle(args);status.putLong("received",SystemClock.elapsedRealtime());}
+            return new Bundle();
+        }
+        if("status".equals(method)){
+            if(uid!=android.os.Process.myUid())throw new SecurityException("App caller required");
+            return status==null?new Bundle():new Bundle(status);
+        }
         SharedPreferences prefs=getContext().getSharedPreferences("app_sizes",0);
         Bundle result=new Bundle();
         long generation=prefs.getLong("generation",0);

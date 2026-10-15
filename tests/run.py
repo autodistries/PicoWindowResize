@@ -10,3 +10,6 @@ with tempfile.TemporaryDirectory(prefix="pico-native-drag-tests-") as output:
     target=Path(output)/"drag-tests"
     subprocess.run(["c++","-std=c++17","-O2",str(r/"tests/drag_host.cpp"),"-o",str(target)],check=True)
     subprocess.run([str(target)],check=True)
+    discovery=Path(output)/"discovery-tests"
+    subprocess.run(["c++","-std=c++17","-O2",str(r/"tests/discovery_host.cpp"),"-ldl","-o",str(discovery)],check=True)
+    subprocess.run([str(discovery)],check=True)

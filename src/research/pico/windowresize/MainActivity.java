@@ -5,6 +5,32 @@ import android.content.SharedPreferences;
 import android.widget.*;
 
 public final class MainActivity extends Activity {
+    private TextView compatibility;
+    private final android.os.Handler refreshTimer=new android.os.Handler(android.os.Looper.getMainLooper());
+    private final java.util.concurrent.ExecutorService statusWorker=java.util.concurrent.Executors.newSingleThreadExecutor();
+    private final java.util.concurrent.atomic.AtomicBoolean refreshing=new java.util.concurrent.atomic.AtomicBoolean();
+    private String binaryStatus;
+    private final Runnable refreshTick=new Runnable(){public void run(){refreshStatus();refreshTimer.postDelayed(this,5000);}};
+    private void refreshStatus(){
+        if(!refreshing.compareAndSet(false,true))return;
+        statusWorker.execute(()->{String text;
+            try{
+                if(binaryStatus==null)binaryStatus=Compatibility.binary(this);
+                Bundle status=getContentResolver().call(SizeStore.URI,"status",null,null);
+                text="Compatibility checks\n\n"+binaryStatus+"\n"+Compatibility.live(status)
+                    +"\nKnown baseline: PICO 4 / Phoenix, OS 5.13.3 / 5.13.7 / 5.13.8. A different binary may pass live contracts; PASS covers checked hooks, not every possible device behavior.";
+            }catch(Throwable failure){text="Compatibility checks unavailable: "+failure;}
+            final String result=text;
+            refreshing.set(false);runOnUiThread(()->{if(!isDestroyed())compatibility.setText(result);});
+        });
+    }
+    @Override protected void onResume(){super.onResume();refreshTimer.post(refreshTick);}
+    @Override protected void onPause(){refreshTimer.removeCallbacks(refreshTick);super.onPause();}
+    @Override protected void onDestroy(){refreshTimer.removeCallbacks(refreshTick);statusWorker.shutdownNow();super.onDestroy();}
+    @Override public void dump(String prefix,java.io.FileDescriptor fd,java.io.PrintWriter out,String[] args){
+        super.dump(prefix,fd,out,args);
+        if(compatibility!=null)out.println(prefix+compatibility.getText());
+    }
     public boolean isModuleActive() { return false; }
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
@@ -25,6 +51,10 @@ public final class MainActivity extends Activity {
         } catch (SecurityException failure) {
             toggle.setEnabled(false); info.append("\nEnable module + self scope and restart this app to unlock settings.");
         }
-        setContentView(layout);
+        android.view.View divider=new android.view.View(this);divider.setBackgroundColor(0xff777777);
+        LinearLayout.LayoutParams line=new LinearLayout.LayoutParams(-1,1);line.setMargins(0,24,0,24);layout.addView(divider,line);
+        compatibility=new TextView(this);compatibility.setText("Checking compatibility…");compatibility.setTextIsSelectable(true);layout.addView(compatibility);
+        Button refresh=new Button(this);refresh.setText("Refresh compatibility status");refresh.setOnClickListener(view->refreshStatus());layout.addView(refresh);
+        ScrollView scroll=new ScrollView(this);scroll.addView(layout);setContentView(scroll);
     }
 }

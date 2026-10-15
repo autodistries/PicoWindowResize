@@ -4,7 +4,9 @@ An LSPosed module that lets you resize floating Android app windows on PICO 4. H
 
 Window dimensions and scale can be remembered per app and restored when reopened. The module includes a toggle for remembering sizes and a button to forget them.
 
-Supports **PICO 4 / Phoenix, PICO OS 5.13.7, Android 10, arm64**. The native hook checks the firmware build and disables itself on incompatible builds. Some apps enforce their own layout or orientation.
+Below the settings, compatibility diagnostics show the installed XRShell version, native binary SHA-256, loaded ELF build ID, and live results for exported targets, panel layout, accessor ABI, relocations, geometry and hook installation. Unknown binaries can still pass the live checks; stale reports and pending restarts are marked explicitly.
+
+Developed on **PICO 4 / Phoenix, Android 10, arm64**. PICO OS **5.13.3, 5.13.7 and 5.13.8** have identical relevant shell components, verified offline. Version 0.6.1 finds native hooks through exported symbols and relocation tables, derives panel offsets from validated instructions, and checks accessor ABI contracts instead of requiring one firmware build ID. Changed implementations can still require support; this does not guarantee compatibility with other headsets or future updates. Native discovery and hook installation have been verified on a PICO 4 running 5.13.7. Some apps enforce their own layout or orientation.
 
 ## Install
 
