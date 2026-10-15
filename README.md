@@ -10,7 +10,6 @@ Supports **PICO 4 / Phoenix, PICO OS 5.13.7, Android 10, arm64**. The native hoo
 
 1. Download the APK from this repository's **Releases** and install it on the headset.
 2. In LSPosed, enable the module for:
-   - PICO Window Resize (`research.pico.windowresize`)
    - XRShell (`com.picoxr.xrshell`)
    - SystemExt (`com.picovr.systemext`)
 3. Reboot the headset.
